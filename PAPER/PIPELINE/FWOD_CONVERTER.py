@@ -557,7 +557,7 @@ if __name__ == "__main__":
     print("STEP 2: Creating aggregated datasets...")
     print("=" * 60)
 
-    for n_patterns in [2, 4, 5]:
+    for n_patterns in [2, 4, 5, 6, 7, 8, 16]:
         output_agg = os.path.join(OUTPUT_DIR, f"fwod_pattern_{n_patterns}_inclusive.xlsx")
         print(f"\nCreating {n_patterns}-pattern aggregated dataset...")
         create_aggregated_dataset(output_base, output_agg, n_patterns, overlapping=True)
