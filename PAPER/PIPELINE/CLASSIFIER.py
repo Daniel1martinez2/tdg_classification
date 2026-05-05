@@ -32,6 +32,8 @@ from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -55,6 +57,18 @@ class Config:
     n_trials: int = 60
     cv_folds: int = 8
     n_jobs: int = -1
+    use_smote: bool = True
+    smote_k_neighbors: int = 5
+
+
+def _make_smote(config: Config, y: np.ndarray) -> SMOTE:
+    """Build a SMOTE oversampler. k_neighbors is clamped to (min_class_count - 1)
+    so SMOTE never fails on tiny folds."""
+    from collections import Counter
+    counts = Counter(y)
+    min_count = min(counts.values()) if counts else 0
+    k = max(1, min(config.smote_k_neighbors, min_count - 1))
+    return SMOTE(k_neighbors=k, random_state=config.random_state)
 
 
 # =============================================================================
@@ -427,6 +441,11 @@ class HyperparameterOptimizer:
                 X_t, X_v = X_train[train_idx], X_train[val_idx]
                 y_t, y_v = y_train[train_idx], y_train[val_idx]
 
+                # SMOTE inside the fold: oversample only the train portion. The
+                # validation portion stays untouched so CV reflects real distribution.
+                if self.config.use_smote:
+                    X_t, y_t = _make_smote(self.config, y_t).fit_resample(X_t, y_t)
+
                 model_clone = clone(model)
                 model_clone.fit(X_t, y_t)
                 score = f1_score(y_v, model_clone.predict(X_v), average='macro')
@@ -519,6 +538,12 @@ class ModelTrainer:
             tr_idx, val_idx = next(gss.split(X_train, y_train, train_groups))
             X_tr, X_val = X_train[tr_idx], X_train[val_idx]
             y_tr, y_val = y_train[tr_idx], y_train[val_idx]
+
+            # SMOTE only on the inner train portion. Early-stopping val must
+            # reflect the real distribution to give a meaningful stopping signal.
+            if self.config.use_smote:
+                X_tr, y_tr = _make_smote(self.config, y_tr).fit_resample(X_tr, y_tr)
+
             fit_params = {}
             if self.model_def.name == "XGBoost":
                 fit_params = {"eval_set": [(X_val, y_val)], "verbose": False}
@@ -532,7 +557,10 @@ class ModelTrainer:
             model.fit(X_tr, y_tr, **fit_params)
             print(f"  (Early stopping with 10% validation split)")
         else:
-            model.fit(X_train, y_train)
+            X_fit, y_fit = X_train, y_train
+            if self.config.use_smote:
+                X_fit, y_fit = _make_smote(self.config, y_train).fit_resample(X_train, y_train)
+            model.fit(X_fit, y_fit)
 
         # Evaluate on test
         y_pred_test = model.predict(X_test)
@@ -994,15 +1022,24 @@ class EnsembleEvaluator:
             # --- Soft Voting ---
             try:
                 voting = VotingClassifier(estimators=estimators, voting='soft', n_jobs=-1)
-                cv_scores = cross_val_score(voting, X_train, y_train, cv=sgkf,
+                # Wrap with imblearn pipeline so SMOTE runs only on train fold during CV
+                # and on full train during final fit (predict bypasses SMOTE automatically).
+                if self.config.use_smote:
+                    estimator = ImbPipeline([
+                        ("smote", _make_smote(self.config, y_train)),
+                        ("classifier", voting),
+                    ])
+                else:
+                    estimator = voting
+                cv_scores = cross_val_score(estimator, X_train, y_train, cv=sgkf,
                                             scoring='f1_macro', n_jobs=self.config.n_jobs,
                                             groups=train_groups)
-                voting.fit(X_train, y_train)
+                estimator.fit(X_train, y_train)
 
-                test_f1 = f1_score(y_test, voting.predict(X_test), average='macro')
-                holdout_f1 = f1_score(y_holdout, voting.predict(X_holdout), average='macro')
-                test_acc = accuracy_score(y_test, voting.predict(X_test))
-                holdout_acc = accuracy_score(y_holdout, voting.predict(X_holdout))
+                test_f1 = f1_score(y_test, estimator.predict(X_test), average='macro')
+                holdout_f1 = f1_score(y_holdout, estimator.predict(X_holdout), average='macro')
+                test_acc = accuracy_score(y_test, estimator.predict(X_test))
+                holdout_acc = accuracy_score(y_holdout, estimator.predict(X_holdout))
 
                 print(f"  Voting: CV={cv_scores.mean():.4f} | Test={test_f1:.4f} | Holdout={holdout_f1:.4f}")
 
@@ -1023,15 +1060,22 @@ class EnsembleEvaluator:
                     final_estimator=LogisticRegression(max_iter=1000, random_state=self.config.random_state),
                     cv=5, n_jobs=-1
                 )
-                cv_scores = cross_val_score(stacking, X_train, y_train, cv=sgkf,
+                if self.config.use_smote:
+                    estimator = ImbPipeline([
+                        ("smote", _make_smote(self.config, y_train)),
+                        ("classifier", stacking),
+                    ])
+                else:
+                    estimator = stacking
+                cv_scores = cross_val_score(estimator, X_train, y_train, cv=sgkf,
                                             scoring='f1_macro', n_jobs=self.config.n_jobs,
                                             groups=train_groups)
-                stacking.fit(X_train, y_train)
+                estimator.fit(X_train, y_train)
 
-                test_f1 = f1_score(y_test, stacking.predict(X_test), average='macro')
-                holdout_f1 = f1_score(y_holdout, stacking.predict(X_holdout), average='macro')
-                test_acc = accuracy_score(y_test, stacking.predict(X_test))
-                holdout_acc = accuracy_score(y_holdout, stacking.predict(X_holdout))
+                test_f1 = f1_score(y_test, estimator.predict(X_test), average='macro')
+                holdout_f1 = f1_score(y_holdout, estimator.predict(X_holdout), average='macro')
+                test_acc = accuracy_score(y_test, estimator.predict(X_test))
+                holdout_acc = accuracy_score(y_holdout, estimator.predict(X_holdout))
 
                 print(f"  Stacking: CV={cv_scores.mean():.4f} | Test={test_f1:.4f} | Holdout={holdout_f1:.4f}")
 
@@ -1088,6 +1132,10 @@ def main():
                         help="Path to a previous results .xlsx to resume from")
     parser.add_argument("--all-classes", action="store_true",
                         help="Use all 20 classes instead of 4-class state-of-art comparison")
+    parser.add_argument("--no-smote", action="store_true",
+                        help="Disable SMOTE oversampling (default is SMOTE-CV enabled)")
+    parser.add_argument("--smote-k", type=int, default=5,
+                        help="k_neighbors for SMOTE (default 5)")
     args = parser.parse_args()
 
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1113,7 +1161,9 @@ def main():
         random_state=42,
         n_trials=60,
         cv_folds=8,
-        n_jobs=-1
+        n_jobs=-1,
+        use_smote=not args.no_smote,
+        smote_k_neighbors=args.smote_k,
     )
 
     # ============== STATE OF ART COMPARISON MODE ==============
@@ -1124,11 +1174,12 @@ def main():
 
     # Determine output file path
     classes_suffix = "_4classes" if USE_STATE_OF_ART_CLASSES else "_all_classes"
+    smote_suffix = "_smote" if config.use_smote else "_baseline"
     if args.resume:
         output_file = args.resume
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(RESULTS_DIR, f"classification_results{classes_suffix}_{timestamp}.xlsx")
+        output_file = os.path.join(RESULTS_DIR, f"classification_results{classes_suffix}{smote_suffix}_{timestamp}.xlsx")
 
     console.print("\n")
     console.rule("[bold magenta]FWOD GENRE CLASSIFICATION PIPELINE", style="magenta")
@@ -1136,6 +1187,8 @@ def main():
         console.print(f"[bold yellow]Mode: State of Art Comparison (4 classes: {STATE_OF_ART_CLASSES})[/bold yellow]")
     console.print(f"[bold yellow]Metric: Macro F1 Score[/bold yellow]")
     console.print(f"[bold yellow]Config: {config.n_trials} trials, {config.cv_folds} CV folds[/bold yellow]")
+    smote_status = f"ON (k={config.smote_k_neighbors}, in-fold)" if config.use_smote else "OFF"
+    console.print(f"[bold yellow]SMOTE: {smote_status}[/bold yellow]")
     console.print(f"[bold yellow]Models: {len(MODELS_TO_RUN)} individual + {'ensembles' if RUN_ENSEMBLES else 'no ensembles'}[/bold yellow]")
     console.print(f"[bold yellow]Output: {output_file}[/bold yellow]")
     if args.resume:
